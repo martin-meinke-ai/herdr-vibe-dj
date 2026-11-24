@@ -1,0 +1,1644 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import base64
+import fcntl
+import hashlib
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import socketserver
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+import argparse
+import shlex
+import subprocess
+import sys
+import tempfile
+
+STATE_DIR = Path(os.environ.get("HERDR_SPOTIFY_STATE_DIR") or (Path.home() / ".local/state/herdr-spotify"))
+
+
+def ensure_env() -> None:
+    local_bin = str(Path.home() / ".local/bin")
+    path = os.environ.get("PATH", "")
+    parts = [p for p in path.split(os.pathsep) if p]
+    if local_bin not in parts:
+        os.environ["PATH"] = f"{local_bin}{os.pathsep}{path}" if path else local_bin
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=False) + "\n")
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def spawn_detached(cmd: list[str], log_path: Path | None = None, cwd: Path | None = None) -> str | None:
+    ensure_env()
+    hc_bin = str(Path.home() / ".local/bin/hc")
+    quoted = " ".join(shlex.quote(c) for c in cmd)
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        script = f"exec >{shlex.quote(str(log_path))} 2>&1; exec {quoted}"
+    else:
+        script = f"exec >/dev/null 2>&1; exec {quoted}"
+
+    if Path(hc_bin).exists():
+        hc_cmd = [
+            hc_bin,
+            "run",
+            "--bg",
+            "--no-parent",
+            "--outlive-parent",
+            "--no-notify",
+            "--rm",
+            "--json",
+        ]
+        if cwd is not None:
+            hc_cmd.extend(["--cwd", str(cwd)])
+        hc_cmd.extend(["--", "bash", "-lc", script])
+        r = subprocess.run(hc_cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, check=False)
+        if r.returncode == 0:
+            try:
+                return json.loads(r.stdout).get("address")
+            except Exception:
+                return "hc-bg"
+
+    out_f = log_path.open("a", encoding="utf-8") if log_path is not None else subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdin=subprocess.DEVNULL,
+            stdout=out_f,
+            stderr=out_f,
+            start_new_session=True,
+        )
+    finally:
+        if log_path is not None and out_f is not subprocess.DEVNULL:
+            out_f.close()
+    return None
+
+SPOTIFY_DIR = STATE_DIR
+CONFIG_PATH = SPOTIFY_DIR / "config.json"
+TOKENS_PATH = SPOTIFY_DIR / "tokens.json"
+AUTH_STATE_PATH = SPOTIFY_DIR / "auth_state.json"
+AUTH_LOG_PATH = SPOTIFY_DIR / "auth_worker.log"
+CACHE_PATH = SPOTIFY_DIR / "playback_cache.json"
+REFRESH_LOCK_PATH = SPOTIFY_DIR / "refresh.lock"
+VIBE_DJ_STATE_PATH = SPOTIFY_DIR / "vibe_dj.json"
+VIBE_DJ_LOCK_PATH = SPOTIFY_DIR / "vibe_dj.lock"
+
+VIBE_DJ_DEFAULT_DEPTH = 1
+VIBE_DJ_MAX_DEPTH = 5
+VIBE_DJ_LEAD_TIME_MS = 60_000
+VIBE_DJ_MIN_TICK_INTERVAL_S = 12.0
+VIBE_DJ_RECENT_LIMIT = 60
+_UNSET: Any = object()
+
+DEFAULT_REDIRECT_PORT = 18472
+DEFAULT_REDIRECT_URI = f"http://127.0.0.1:{DEFAULT_REDIRECT_PORT}/callback"
+
+SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+
+SPOTIFY_SCOPES = (
+    "user-read-playback-state "
+    "user-modify-playback-state "
+    "user-read-currently-playing "
+    "user-library-read "
+    "user-library-modify "
+    "user-top-read "
+    "playlist-read-private"
+)
+
+CACHE_TTL_S = 3.0
+TOKEN_REFRESH_HEADROOM_S = 90.0
+CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9]{16,64}$")
+
+
+def _ensure_spotify_dir() -> None:
+    ensure_env()
+    SPOTIFY_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(SPOTIFY_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _write_secret_json(path: Path, data: Any) -> None:
+    _ensure_spotify_dir()
+    atomic_write_json(path, data)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def _refresh_lock() -> Iterator[None]:
+    _ensure_spotify_dir()
+    with REFRESH_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def load_config() -> dict[str, str]:
+    _ensure_spotify_dir()
+    cfg = read_json(CONFIG_PATH, default={})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    client_id = (os.environ.get("SPOTIFY_CLIENT_ID") or cfg.get("client_id") or "").strip()
+    redirect_uri = (
+        os.environ.get("SPOTIFY_REDIRECT_URI")
+        or cfg.get("redirect_uri")
+        or DEFAULT_REDIRECT_URI
+    ).strip()
+    return {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+    }
+
+
+def set_client_id(client_id: str, redirect_uri: str | None = None) -> dict[str, Any]:
+    cleaned = client_id.strip()
+    if not CLIENT_ID_RE.match(cleaned):
+        raise ValueError("Invalid Spotify Client ID (expected 16–64 alphanumeric characters).")
+    cfg = load_config()
+    uri = (redirect_uri or cfg.get("redirect_uri") or DEFAULT_REDIRECT_URI).strip()
+    _write_secret_json(CONFIG_PATH, {"client_id": cleaned, "redirect_uri": uri})
+    return {
+        "ok": True,
+        "configured": True,
+        "client_id_preview": f"{cleaned[:6]}…{cleaned[-4:]}",
+        "redirect_uri": uri,
+    }
+
+
+def load_tokens() -> dict[str, Any] | None:
+    _ensure_spotify_dir()
+    tok = read_json(TOKENS_PATH, default=None)
+    if not isinstance(tok, dict) or not tok.get("access_token"):
+        return None
+    return tok
+
+
+def logout() -> dict[str, Any]:
+    _ensure_spotify_dir()
+    for p in (TOKENS_PATH, AUTH_STATE_PATH, CACHE_PATH):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    return {"ok": True, "authenticated": False}
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def make_pkce_pair() -> tuple[str, str]:
+    verifier = _b64url(secrets.token_bytes(64))
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+def build_authorize_url(client_id: str, redirect_uri: str, state: str, code_challenge: str) -> str:
+    assert client_id, "client_id is required"
+    assert redirect_uri, "redirect_uri is required"
+    params = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": SPOTIFY_SCOPES,
+            "code_challenge_method": "S256",
+            "code_challenge": code_challenge,
+            "show_dialog": "false",
+        }
+    )
+    return f"{SPOTIFY_AUTH_URL}?{params}"
+
+
+def _token_request(form_data: dict[str, str], timeout_s: float = 15.0) -> dict[str, Any]:
+    encoded = urllib.parse.urlencode(form_data).encode("utf-8")
+    req = urllib.request.Request(
+        SPOTIFY_TOKEN_URL,
+        data=encoded,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        detail = err_body
+        try:
+            parsed = json.loads(err_body)
+            detail = parsed.get("error_description") or parsed.get("error") or err_body
+        except Exception:
+            pass
+        raise RuntimeError(f"Spotify token error ({exc.code}): {detail}") from exc
+
+
+def _save_token_response(payload: dict[str, Any], prev_refresh_token: str | None = None) -> dict[str, Any]:
+    access_token = payload.get("access_token")
+    assert access_token, "Spotify token response missing access_token"
+    expires_in = float(payload.get("expires_in") or 3600)
+    refresh_token = payload.get("refresh_token") or prev_refresh_token
+    saved = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": payload.get("token_type") or "Bearer",
+        "scope": payload.get("scope") or SPOTIFY_SCOPES,
+        "expires_at": time.time() + expires_in,
+        "updated_at": time.time(),
+    }
+    _write_secret_json(TOKENS_PATH, saved)
+    return saved
+
+
+def exchange_auth_code(code: str, state: str | None = None) -> dict[str, Any]:
+    cfg = load_config()
+    if not cfg["client_id"]:
+        raise RuntimeError("Spotify Client ID is not configured.")
+    auth_state = read_json(AUTH_STATE_PATH, default=None)
+    if not isinstance(auth_state, dict) or not auth_state.get("code_verifier"):
+        raise RuntimeError("No active Spotify login session found. Click Connect Spotify to start.")
+    expected_state = auth_state.get("state")
+    if state is not None and expected_state and state != expected_state:
+        raise RuntimeError("OAuth state mismatch. Please restart Spotify login.")
+
+    payload = _token_request(
+        {
+            "client_id": cfg["client_id"],
+            "grant_type": "authorization_code",
+            "code": code.strip(),
+            "redirect_uri": auth_state.get("redirect_uri") or cfg["redirect_uri"],
+            "code_verifier": auth_state["code_verifier"],
+        }
+    )
+    _save_token_response(payload)
+    done_state = {
+        **auth_state,
+        "status": "done",
+        "finished_at": time.time(),
+        "error": "",
+    }
+    done_state.pop("code_verifier", None)
+    _write_secret_json(AUTH_STATE_PATH, done_state)
+    try:
+        CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    return {"ok": True, "status": "done", "authenticated": True}
+
+
+def complete_auth_from_input(url_or_code: str) -> dict[str, Any]:
+    raw = url_or_code.strip()
+    if not raw:
+        raise ValueError("Paste the Spotify callback URL (or authorization code).")
+    if "://" in raw or raw.startswith("/callback") or "code=" in raw:
+        parsed = urllib.parse.urlparse(raw)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "error" in qs:
+            err = qs["error"][0]
+            raise RuntimeError(f"Spotify authorization denied: {err}")
+        code = (qs.get("code") or [""])[0].strip()
+        state = (qs.get("state") or [None])[0]
+        if not code:
+            raise ValueError("Callback URL does not contain a 'code' parameter.")
+        return exchange_auth_code(code=code, state=state)
+    return exchange_auth_code(code=raw, state=None)
+
+
+class _ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+def _render_callback_html(ok: bool, message: str) -> bytes:
+    title = "Spotify Connected" if ok else "Spotify Login Error"
+    accent = "#1DB954" if ok else "#e5534b"
+    safe_msg = html.escape(message)
+    body = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>{title} — Herdr</title></head>
+<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#111318;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">
+  <div style="max-width:420px;padding:28px 32px;border-radius:14px;background:#1b1f27;border:1px solid #2d333b;text-align:center;">
+    <div style="width:12px;height:12px;border-radius:50%;background:{accent};margin:0 auto 14px;"></div>
+    <h2 style="margin:0 0 8px;font-size:18px;">{title}</h2>
+    <p style="margin:0;color:#8b949e;font-size:14px;line-height:1.5;">{safe_msg}</p>
+  </div>
+</body>
+</html>"""
+    return body.encode("utf-8")
+
+
+def run_auth_worker(timeout_s: int = 300) -> int:
+    _ensure_spotify_dir()
+    auth_state = read_json(AUTH_STATE_PATH, default=None)
+    if not isinstance(auth_state, dict) or not auth_state.get("code_verifier"):
+        return 1
+    redirect_uri = auth_state.get("redirect_uri") or DEFAULT_REDIRECT_URI
+    parsed = urllib.parse.urlparse(redirect_uri)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or DEFAULT_REDIRECT_PORT
+    callback_path = parsed.path or "/callback"
+
+    auth_state["pid"] = os.getpid()
+    _write_secret_json(AUTH_STATE_PATH, auth_state)
+
+    done_event = threading.Event()
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            req_url = urllib.parse.urlparse(self.path)
+            if req_url.path != callback_path:
+                self.send_response(404)
+                self.end_headers()
+                return
+            qs = urllib.parse.parse_qs(req_url.query)
+            if "error" in qs:
+                err = qs["error"][0]
+                _write_secret_json(
+                    AUTH_STATE_PATH,
+                    {
+                        **read_json(AUTH_STATE_PATH, default={}),
+                        "status": "error",
+                        "error": f"Spotify authorization denied: {err}",
+                        "finished_at": time.time(),
+                    },
+                )
+                page = _render_callback_html(False, f"Authorization denied: {err}")
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                done_event.set()
+                return
+
+            code = (qs.get("code") or [""])[0].strip()
+            state = (qs.get("state") or [None])[0]
+            try:
+                exchange_auth_code(code=code, state=state)
+                page = _render_callback_html(True, "You're connected to Herdr. You can close this tab.")
+                self.send_response(200)
+            except Exception as exc:
+                _write_secret_json(
+                    AUTH_STATE_PATH,
+                    {
+                        **read_json(AUTH_STATE_PATH, default={}),
+                        "status": "error",
+                        "error": str(exc),
+                        "finished_at": time.time(),
+                    },
+                )
+                page = _render_callback_html(False, str(exc))
+                self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+            done_event.set()
+
+    try:
+        httpd = _ReusableTCPServer((host, port), CallbackHandler)
+    except OSError as exc:
+        # Port might already be bound; keep state pending so manual/remote completion still works.
+        cur = read_json(AUTH_STATE_PATH, default={})
+        if isinstance(cur, dict):
+            cur["listener_warning"] = f"Local callback port {port} unavailable: {exc}"
+            _write_secret_json(AUTH_STATE_PATH, cur)
+        return 0
+
+    httpd.timeout = 0.5
+    deadline = time.time() + timeout_s
+    try:
+        while not done_event.is_set() and time.time() < deadline:
+            cur = read_json(AUTH_STATE_PATH, default={})
+            if isinstance(cur, dict) and cur.get("status") == "done":
+                break
+            httpd.handle_request()
+    finally:
+        httpd.server_close()
+    return 0
+
+
+def start_auth() -> dict[str, Any]:
+    cfg = load_config()
+    if not cfg["client_id"]:
+        return {
+            "status": "error",
+            "configured": False,
+            "redirect_uri": cfg["redirect_uri"],
+            "error": "Set your Spotify Client ID first.",
+        }
+
+    verifier, challenge = make_pkce_pair()
+    state = secrets.token_urlsafe(24)
+    auth_url = build_authorize_url(
+        client_id=cfg["client_id"],
+        redirect_uri=cfg["redirect_uri"],
+        state=state,
+        code_challenge=challenge,
+    )
+    record = {
+        "status": "pending",
+        "auth_url": auth_url,
+        "redirect_uri": cfg["redirect_uri"],
+        "state": state,
+        "code_verifier": verifier,
+        "started_at": time.time(),
+        "error": "",
+    }
+    _write_secret_json(AUTH_STATE_PATH, record)
+
+    cli_bin = str(Path.home() / ".local/bin/herdr-spotify")
+    if Path(cli_bin).exists():
+        spawn_detached([cli_bin, "--_auth-worker"], log_path=AUTH_LOG_PATH)
+
+    return {
+        "status": "pending",
+        "configured": True,
+        "auth_url": auth_url,
+        "redirect_uri": cfg["redirect_uri"],
+        "state": state,
+    }
+
+
+def get_auth_status() -> dict[str, Any]:
+    cfg = load_config()
+    tokens = load_tokens()
+    st = read_json(AUTH_STATE_PATH, default=None)
+    status = st.get("status") if isinstance(st, dict) else "idle"
+    if status == "pending":
+        started_at = float(st.get("started_at") or 0)
+        if (time.time() - started_at) > 360:
+            status = "error"
+            st = {**st, "status": "error", "error": "Spotify login timed out."}
+            _write_secret_json(AUTH_STATE_PATH, st)
+    return {
+        "status": status,
+        "configured": bool(cfg["client_id"]),
+        "authenticated": bool(tokens),
+        "redirect_uri": cfg["redirect_uri"],
+        "auth_url": st.get("auth_url") if isinstance(st, dict) else None,
+        "error": st.get("error") if isinstance(st, dict) else "",
+    }
+
+
+def _get_valid_access_token() -> str:
+    tokens = load_tokens()
+    if not tokens:
+        raise PermissionError("Not connected to Spotify.")
+    expires_at = float(tokens.get("expires_at") or 0)
+    if time.time() + TOKEN_REFRESH_HEADROOM_S < expires_at:
+        return str(tokens["access_token"])
+
+    with _refresh_lock():
+        # Re-read under lock in case another process already refreshed.
+        tokens = load_tokens()
+        if not tokens:
+            raise PermissionError("Not connected to Spotify.")
+        expires_at = float(tokens.get("expires_at") or 0)
+        if time.time() + TOKEN_REFRESH_HEADROOM_S < expires_at:
+            return str(tokens["access_token"])
+
+        refresh_token = tokens.get("refresh_token")
+        cfg = load_config()
+        if not refresh_token or not cfg["client_id"]:
+            raise PermissionError("Spotify session expired — please reconnect.")
+
+        try:
+            payload = _token_request(
+                {
+                    "client_id": cfg["client_id"],
+                    "grant_type": "refresh_token",
+                    "refresh_token": str(refresh_token),
+                }
+            )
+        except RuntimeError as exc:
+            if "invalid_grant" in str(exc).lower() or "(400)" in str(exc):
+                raise PermissionError(f"Spotify session expired ({exc}) — please reconnect.") from exc
+            raise
+        saved = _save_token_response(payload, prev_refresh_token=str(refresh_token))
+        return str(saved["access_token"])
+
+
+def _api_request(
+    method: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    json_body: Any = None,
+    timeout_s: float = 10.0,
+    retry_auth: bool = True,
+) -> tuple[int, Any]:
+    token = _get_valid_access_token()
+    url = f"{SPOTIFY_API_BASE}{path}"
+    if params:
+        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        if qs:
+            url = f"{url}?{qs}"
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif method in {"PUT", "POST"}:
+        data = b""
+
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if resp.status == 204 or not raw.strip():
+                return resp.status, None
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                if method != "GET":
+                    # Spotify playback mutations (play/pause/next/queue) can return 200 with a non-JSON body.
+                    return resp.status, None
+                raise RuntimeError(f"Spotify API {resp.status} returned invalid JSON: {raw[:80]!r}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and retry_auth:
+            # Force refresh once on 401
+            tokens = load_tokens()
+            if tokens:
+                tokens["expires_at"] = 0
+                _write_secret_json(TOKENS_PATH, tokens)
+            return _api_request(method, path, params=params, json_body=json_body, timeout_s=timeout_s, retry_auth=False)
+        raw_err = exc.read().decode("utf-8", errors="replace")
+        msg = raw_err
+        reason = ""
+        try:
+            parsed = json.loads(raw_err)
+            err_obj = parsed.get("error")
+            if isinstance(err_obj, dict):
+                msg = err_obj.get("message") or msg
+                reason = err_obj.get("reason") or ""
+        except Exception:
+            pass
+        if exc.code == 401:
+            raise PermissionError(f"Spotify auth expired: {msg}") from exc
+        if exc.code == 403 and reason == "PREMIUM_REQUIRED":
+            raise RuntimeError("Spotify Premium is required to control playback via Web API.") from exc
+        if exc.code == 404 and reason == "NO_ACTIVE_DEVICE":
+            raise RuntimeError("No active Spotify device found. Open Spotify on any device first.") from exc
+        raise RuntimeError(f"Spotify API {exc.code}: {msg}") from exc
+
+
+def _normalize_playback(raw: dict[str, Any] | None, is_liked: bool | None = None) -> dict[str, Any]:
+    cfg = load_config()
+    base = {
+        "configured": bool(cfg["client_id"]),
+        "authenticated": True,
+        "auth_required": False,
+        "redirect_uri": cfg["redirect_uri"],
+        "fetched_at": time.time(),
+    }
+    if not raw or not raw.get("item"):
+        return {
+            **base,
+            "active": False,
+            "is_playing": False,
+            "track_id": None,
+            "track": None,
+            "artists": None,
+            "album": None,
+            "artwork_url": None,
+            "track_url": None,
+            "progress_ms": 0,
+            "duration_ms": 0,
+            "shuffle": False,
+            "repeat": "off",
+            "volume_percent": None,
+            "is_liked": False,
+            "device": None,
+        }
+
+    item = raw["item"]
+    item_type = raw.get("currently_playing_type") or item.get("type") or "track"
+    album_obj = item.get("album") or item.get("show") or {}
+    images = album_obj.get("images") or item.get("images") or []
+    artwork_url = None
+    if images:
+        # Prefer medium ~300px artwork for crisp mini-player display without huge downloads
+        sorted_imgs = sorted(images, key=lambda im: abs(int(im.get("width") or 300) - 300))
+        artwork_url = sorted_imgs[0].get("url")
+
+    artists_list = item.get("artists") or []
+    if artists_list:
+        artists = ", ".join(a.get("name", "") for a in artists_list if a.get("name"))
+    else:
+        artists = album_obj.get("publisher") or album_obj.get("name") or ""
+
+    device_raw = raw.get("device") or {}
+    device = None
+    if device_raw:
+        device = {
+            "id": device_raw.get("id"),
+            "name": device_raw.get("name"),
+            "type": device_raw.get("type"),
+            "volume_percent": device_raw.get("volume_percent"),
+            "is_active": bool(device_raw.get("is_active", True)),
+        }
+
+    return {
+        **base,
+        "active": True,
+        "item_type": item_type,
+        "is_playing": bool(raw.get("is_playing")),
+        "track_id": item.get("id"),
+        "track": item.get("name") or "",
+        "artists": artists,
+        "album": album_obj.get("name") or "",
+        "artwork_url": artwork_url,
+        "track_url": (item.get("external_urls") or {}).get("spotify"),
+        "progress_ms": int(raw.get("progress_ms") or 0),
+        "duration_ms": int(item.get("duration_ms") or 0),
+        "shuffle": bool(raw.get("shuffle_state")),
+        "repeat": raw.get("repeat_state") or "off",
+        "volume_percent": device_raw.get("volume_percent"),
+        "is_liked": bool(is_liked) if is_liked is not None else False,
+        "device": device,
+    }
+
+
+def _track_uri(track_id: str) -> str:
+    cleaned = track_id.strip()
+    return cleaned if cleaned.startswith("spotify:") else f"spotify:track:{cleaned}"
+
+
+def _check_track_liked(track_id: str | None, prev_cache: dict[str, Any] | None) -> bool | None:
+    if not track_id:
+        return None
+    if isinstance(prev_cache, dict) and prev_cache.get("track_id") == track_id and "is_liked" in prev_cache:
+        return bool(prev_cache["is_liked"])
+    try:
+        status, data = _api_request("GET", "/me/library/contains", params={"uris": _track_uri(track_id)})
+        if status == 200 and isinstance(data, list) and data:
+            return bool(data[0])
+    except Exception:
+        return None
+    return None
+
+
+def get_status(force: bool = False) -> dict[str, Any]:
+    cfg = load_config()
+    if not cfg["client_id"]:
+        return {
+            "configured": False,
+            "authenticated": False,
+            "auth_required": True,
+            "active": False,
+            "redirect_uri": cfg["redirect_uri"],
+            "error": "",
+        }
+    tokens = load_tokens()
+    if not tokens:
+        return {
+            "configured": True,
+            "authenticated": False,
+            "auth_required": True,
+            "active": False,
+            "redirect_uri": cfg["redirect_uri"],
+            "error": "",
+        }
+
+    cached = read_json(CACHE_PATH, default=None)
+    if not force and isinstance(cached, dict):
+        age = time.time() - float(cached.get("fetched_at") or 0)
+        if 0 <= age < CACHE_TTL_S and not cached.get("error"):
+            return cached
+
+    try:
+        status_code, raw = _api_request("GET", "/me/player", params={"additional_types": "track,episode"})
+        if status_code == 204 or not raw:
+            result = _normalize_playback(None)
+        else:
+            item = raw.get("item") or {}
+            track_id = item.get("id") if (raw.get("currently_playing_type") or "track") == "track" else None
+            liked = _check_track_liked(track_id, cached)
+            result = _normalize_playback(raw, is_liked=liked)
+        atomic_write_json(CACHE_PATH, result)
+        return result
+    except PermissionError as exc:
+        return {
+            "configured": True,
+            "authenticated": False,
+            "auth_required": True,
+            "active": False,
+            "redirect_uri": cfg["redirect_uri"],
+            "error": str(exc),
+        }
+    except Exception as exc:
+        if isinstance(cached, dict) and cached.get("authenticated"):
+            return {**cached, "stale": True, "error": str(exc)}
+        return {
+            "configured": True,
+            "authenticated": True,
+            "auth_required": False,
+            "active": False,
+            "redirect_uri": cfg["redirect_uri"],
+            "error": str(exc),
+        }
+
+
+def _invalidate_cache() -> None:
+    try:
+        CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def control_playback(action: str, value: str | None = None, track_id: str | None = None) -> dict[str, Any]:
+    assert action in {"play", "pause", "toggle", "next", "prev", "seek", "volume", "shuffle", "repeat", "like", "transfer"}, (
+        f"Unsupported action: {action}"
+    )
+    if action == "toggle":
+        cur = get_status(force=True)
+        if not cur.get("authenticated"):
+            return cur
+        action = "pause" if cur.get("is_playing") else "play"
+
+    if action == "play":
+        _api_request("PUT", "/me/player/play")
+    elif action == "pause":
+        _api_request("PUT", "/me/player/pause")
+    elif action == "next":
+        _api_request("POST", "/me/player/next")
+    elif action == "prev":
+        _api_request("POST", "/me/player/previous")
+    elif action == "seek":
+        assert value is not None, "seek requires position_ms"
+        pos = max(0, int(value))
+        _api_request("PUT", "/me/player/seek", params={"position_ms": pos})
+    elif action == "volume":
+        assert value is not None, "volume requires 0..100"
+        vol = max(0, min(100, int(value)))
+        _api_request("PUT", "/me/player/volume", params={"volume_percent": vol})
+    elif action == "shuffle":
+        assert value in {"on", "off", "true", "false"}, f"Invalid shuffle value: {value}"
+        state_bool = "true" if value in {"on", "true"} else "false"
+        _api_request("PUT", "/me/player/shuffle", params={"state": state_bool})
+    elif action == "repeat":
+        assert value in {"off", "context", "track"}, f"Invalid repeat value: {value}"
+        _api_request("PUT", "/me/player/repeat", params={"state": value})
+    elif action == "like":
+        assert track_id, "like requires track_id"
+        assert value in {"on", "off", "true", "false"}, f"Invalid like value: {value}"
+        method = "PUT" if value in {"on", "true"} else "DELETE"
+        _api_request(method, "/me/library", params={"uris": _track_uri(track_id)})
+    elif action == "transfer":
+        assert value, "transfer requires device_id"
+        _api_request("PUT", "/me/player", json_body={"device_ids": [value], "play": True})
+
+    _invalidate_cache()
+    if action in {"next", "prev", "transfer"}:
+        time.sleep(0.25)
+    return get_status(force=True)
+
+
+def list_devices() -> dict[str, Any]:
+    _, data = _api_request("GET", "/me/player/devices")
+    devices = (data or {}).get("devices") or []
+    return {
+        "devices": [
+            {
+                "id": d.get("id"),
+                "name": d.get("name"),
+                "type": d.get("type"),
+                "is_active": bool(d.get("is_active")),
+                "volume_percent": d.get("volume_percent"),
+                "is_restricted": bool(d.get("is_restricted")),
+            }
+            for d in devices
+            if d.get("id")
+        ]
+    }
+
+
+VIBE_PRESETS: dict[str, dict[str, Any]] = {
+    "zen": {
+        "label": "Zen Focus",
+        "subtitle": "Mellow concentration & calm",
+        "vibes": {
+            "calm": ["ambient focus instrumental", "deep calm piano focus", "peaceful coding instrumental"],
+            "lofi": ["lofi chill beats study", "mellow lofi hip hop instrumental"],
+            "acoustic": ["chill acoustic instrumental focus", "soft guitar ambient"],
+        },
+    },
+    "flow": {
+        "label": "Steady Flow",
+        "subtitle": "Groovy rhythmic focus",
+        "vibes": {
+            "chill-elec": ["chill electronic melodic house", "downtempo electronic focus", "organic house instrumental"],
+            "indie": ["chill indie groove", "khruangbin style instrumental groove"],
+            "bachata": ["chill acoustic bachata", "modern smooth bachata"],
+        },
+    },
+    "cranking": {
+        "label": "Cranking",
+        "subtitle": "Engaged & high-energy",
+        "vibes": {
+            "electronic": ["melodic techno driving", "progressive house upbeat", "tech house energy"],
+            "bachata": ["bachata sensual dance hits", "romeo santos prince royce bachata", "upbeat bachata moderna"],
+            "synthwave": ["retrowave synthwave coding", "upbeat darksynth electronic"],
+        },
+    },
+    "overdrive": {
+        "label": "Vibecode Overdrive",
+        "subtitle": "Full throttle multi-agent mode",
+        "vibes": {
+            "electronic": ["high energy liquid drum and bass", "peak time techno electronic", "high bpm electro house"],
+            "bachata": ["energetic bachata urbana party", "upbeat latin bachata dance"],
+            "dnb": ["energetic drum and bass coding", "neurofunk liquid dnb"],
+        },
+    },
+}
+
+
+TIER_ENERGY_MODIFIERS: dict[str, str] = {
+    "zen": "calm chill",
+    "flow": "groove",
+    "cranking": "upbeat driving",
+    "overdrive": "high energy",
+}
+
+
+def _parse_preference_queries(raw: str) -> list[str]:
+    parts = [p.strip() for p in re.split(r"[,;\n]+", raw or "") if p.strip()]
+    return parts[:8]
+
+
+def _custom_queries_for_tier(
+    tier: str,
+    taste: str = "",
+    custom_queries: dict[str, str] | None = None,
+) -> list[str]:
+    assert tier in VIBE_PRESETS, f"Unknown tier: {tier}"
+    per_tier = (custom_queries or {}).get(tier) or ""
+    explicit = _parse_preference_queries(per_tier)
+    if explicit:
+        return explicit
+    taste_parts = _parse_preference_queries(taste)
+    if taste_parts:
+        mod = TIER_ENERGY_MODIFIERS[tier]
+        return [f"{part} {mod}" for part in taste_parts]
+    return []
+
+
+def compute_vibe_tier(working_agents: int, inverse: bool = False) -> str:
+    count = max(0, working_agents)
+    if count <= 1:
+        idx = 0
+    elif count <= 3:
+        idx = 1
+    elif count <= 5:
+        idx = 2
+    else:
+        idx = 3
+    order = ("overdrive", "cranking", "flow", "zen") if inverse else ("zen", "flow", "cranking", "overdrive")
+    return order[idx]
+
+
+def suggest_tracks(
+    intensity: str = "flow",
+    vibe: str | None = None,
+    offset: int = 0,
+    limit: int = 5,
+    taste: str | None = None,
+    custom_queries: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    tier = intensity if intensity in VIBE_PRESETS else "flow"
+    preset = VIBE_PRESETS[tier]
+    vibes_map: dict[str, list[str]] = dict(preset["vibes"])
+    if taste is None and custom_queries is None:
+        saved = _load_vibe_dj_state()
+        eff_taste = saved.get("taste") or ""
+        eff_custom = saved.get("custom_queries") or {}
+    else:
+        eff_taste = taste or ""
+        eff_custom = custom_queries or {}
+    tier_custom = _custom_queries_for_tier(tier, taste=eff_taste, custom_queries=eff_custom)
+    if tier_custom:
+        vibes_map = {"custom": tier_custom, **vibes_map}
+    vibe_keys = list(vibes_map.keys())
+    selected_vibe = vibe if vibe in vibes_map else vibe_keys[0]
+    queries = vibes_map[selected_vibe]
+    query = queries[abs(int(offset)) % len(queries)]
+    search_offset = (abs(int(offset)) // len(queries)) * limit
+
+    _, data = _api_request(
+        "GET",
+        "/search",
+        params={
+            "q": query,
+            "type": "track",
+            "limit": max(1, min(10, int(limit))),
+            "offset": min(50, search_offset),
+        },
+    )
+    items = ((data or {}).get("tracks") or {}).get("items") or []
+    tracks = []
+    for item in items:
+        if not item or not item.get("uri"):
+            continue
+        artists = ", ".join(a.get("name", "") for a in (item.get("artists") or []) if a.get("name"))
+        tracks.append(
+            {
+                "id": item.get("id"),
+                "uri": item.get("uri"),
+                "track": item.get("name") or "",
+                "artists": artists,
+                "album": (item.get("album") or {}).get("name") or "",
+                "duration_ms": int(item.get("duration_ms") or 0),
+                "track_url": (item.get("external_urls") or {}).get("spotify"),
+            }
+        )
+    return {
+        "tier": tier,
+        "label": preset["label"],
+        "subtitle": preset["subtitle"],
+        "vibe": selected_vibe,
+        "available_vibes": vibe_keys,
+        "query": query,
+        "tracks": tracks,
+    }
+
+
+def play_uri(uri: str) -> dict[str, Any]:
+    cleaned = uri.strip()
+    assert cleaned.startswith("spotify:"), f"Invalid Spotify URI: {cleaned}"
+    if cleaned.startswith("spotify:track:") or cleaned.startswith("spotify:episode:"):
+        _api_request("PUT", "/me/player/play", json_body={"uris": [cleaned]})
+    else:
+        _api_request("PUT", "/me/player/play", json_body={"context_uri": cleaned})
+    _invalidate_cache()
+    time.sleep(0.25)
+    return get_status(force=True)
+
+
+def queue_uri(uri: str) -> dict[str, Any]:
+    cleaned = uri.strip()
+    assert cleaned.startswith("spotify:track:") or cleaned.startswith("spotify:episode:"), (
+        f"Queue requires a track or episode URI: {cleaned}"
+    )
+    _api_request("POST", "/me/player/queue", params={"uri": cleaned})
+    return {"ok": True, "queued": cleaned}
+
+
+@contextmanager
+def _vibe_dj_lock() -> Iterator[None]:
+    _ensure_spotify_dir()
+    with VIBE_DJ_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _default_vibe_dj_state() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "inverse": False,
+        "tier_override": None,
+        "vibe": None,
+        "taste": "",
+        "custom_queries": {},
+        "target_queue_depth": VIBE_DJ_DEFAULT_DEPTH,
+        "offset": 0,
+        "recent_uris": [],
+        "queued_tracks": [],
+        "last_tier": None,
+        "last_vibe": None,
+        "last_playing_uri": None,
+        "queued_for_playing_uri": None,
+        "next_queue_in_s": None,
+        "last_tick_at": 0.0,
+        "last_queued_at": 0.0,
+        "last_action": "off",
+        "last_error": "",
+    }
+
+
+def _load_vibe_dj_state() -> dict[str, Any]:
+    _ensure_spotify_dir()
+    raw = read_json(VIBE_DJ_STATE_PATH, default={})
+    state = _default_vibe_dj_state()
+    if isinstance(raw, dict):
+        state["enabled"] = bool(raw.get("enabled", False))
+        state["inverse"] = bool(raw.get("inverse", False))
+        tier_override = raw.get("tier_override")
+        state["tier_override"] = tier_override if tier_override in VIBE_PRESETS else None
+        vibe = raw.get("vibe")
+        state["vibe"] = str(vibe) if isinstance(vibe, str) and vibe else None
+        taste_raw = raw.get("taste")
+        state["taste"] = str(taste_raw).strip()[:200] if isinstance(taste_raw, str) else ""
+        cq_raw = raw.get("custom_queries")
+        if isinstance(cq_raw, dict):
+            state["custom_queries"] = {
+                str(k): str(v).strip()[:200]
+                for k, v in cq_raw.items()
+                if k in VIBE_PRESETS and isinstance(v, str) and v.strip()
+            }
+        depth = int(raw.get("target_queue_depth") or VIBE_DJ_DEFAULT_DEPTH)
+        state["target_queue_depth"] = max(1, min(VIBE_DJ_MAX_DEPTH, depth))
+        state["offset"] = max(0, int(raw.get("offset") or 0))
+        recent = raw.get("recent_uris")
+        state["recent_uris"] = [str(u) for u in recent if isinstance(u, str) and u][-VIBE_DJ_RECENT_LIMIT:] if isinstance(recent, list) else []
+        queued = raw.get("queued_tracks")
+        state["queued_tracks"] = [dict(t) for t in queued if isinstance(t, dict) and t.get("uri")] if isinstance(queued, list) else []
+        state["last_tier"] = raw.get("last_tier") if raw.get("last_tier") in VIBE_PRESETS else None
+        state["last_vibe"] = str(raw["last_vibe"]) if isinstance(raw.get("last_vibe"), str) else None
+        lp = raw.get("last_playing_uri")
+        state["last_playing_uri"] = str(lp) if isinstance(lp, str) and lp else None
+        qfp = raw.get("queued_for_playing_uri")
+        state["queued_for_playing_uri"] = str(qfp) if isinstance(qfp, str) and qfp else None
+        nqi = raw.get("next_queue_in_s")
+        state["next_queue_in_s"] = int(nqi) if isinstance(nqi, (int, float)) else None
+        state["last_tick_at"] = float(raw.get("last_tick_at") or 0.0)
+        state["last_queued_at"] = float(raw.get("last_queued_at") or 0.0)
+        state["last_action"] = str(raw.get("last_action") or ("armed" if state["enabled"] else "off"))
+        state["last_error"] = str(raw.get("last_error") or "")
+    return state
+
+
+def _save_vibe_dj_state(state: dict[str, Any]) -> None:
+    _ensure_spotify_dir()
+    atomic_write_json(VIBE_DJ_STATE_PATH, state)
+
+
+def _resolve_vibe_selection(
+    working_agents: int,
+    tier_override: str | None,
+    vibe: str | None,
+    inverse: bool = False,
+    taste: str = "",
+    custom_queries: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
+    assert tier_override is None or tier_override in VIBE_PRESETS, f"Invalid tier_override: {tier_override}"
+    auto_tier = compute_vibe_tier(working_agents, inverse=inverse)
+    effective_tier = tier_override or auto_tier
+    vibes_map: dict[str, list[str]] = dict(VIBE_PRESETS[effective_tier]["vibes"])
+    has_custom = bool(_custom_queries_for_tier(effective_tier, taste=taste, custom_queries=custom_queries))
+    if has_custom:
+        vibes_map = {"custom": ["custom"], **vibes_map}
+    vibe_keys = list(vibes_map.keys())
+    effective_vibe = vibe if vibe in vibes_map else vibe_keys[0]
+    return auto_tier, effective_tier, effective_vibe
+
+
+def _format_vibe_dj_response(
+    state: dict[str, Any],
+    *,
+    working_agents: int = 0,
+    added: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    taste = str(state.get("taste") or "")
+    custom_queries = dict(state.get("custom_queries") or {})
+    auto_tier, effective_tier, effective_vibe = _resolve_vibe_selection(
+        working_agents,
+        state.get("tier_override"),
+        state.get("vibe"),
+        inverse=bool(state.get("inverse", False)),
+        taste=taste,
+        custom_queries=custom_queries,
+    )
+    has_custom = bool(_custom_queries_for_tier(effective_tier, taste=taste, custom_queries=custom_queries))
+    queued = list(state.get("queued_tracks") or [])
+    return {
+        "ok": True,
+        "enabled": bool(state.get("enabled")),
+        "inverse": bool(state.get("inverse", False)),
+        "tier": effective_tier,
+        "auto_tier": auto_tier,
+        "tier_override": state.get("tier_override"),
+        "vibe": effective_vibe,
+        "taste": taste,
+        "custom_queries": custom_queries,
+        "has_custom": has_custom,
+        "target_queue_depth": int(state.get("target_queue_depth") or VIBE_DJ_DEFAULT_DEPTH),
+        "working_agents": max(0, int(working_agents)),
+        "queued_ahead": queued,
+        "queued_ahead_count": len(queued),
+        "added": list(added or []),
+        "next_queue_in_s": state.get("next_queue_in_s"),
+        "last_action": state.get("last_action") or ("armed" if state.get("enabled") else "off"),
+        "last_error": state.get("last_error") or "",
+        "last_tick_at": float(state.get("last_tick_at") or 0.0),
+        "last_queued_at": float(state.get("last_queued_at") or 0.0),
+    }
+
+
+def get_queue() -> dict[str, Any]:
+    _, data = _api_request("GET", "/me/player/queue")
+    data = data if isinstance(data, dict) else {}
+    cur = data.get("currently_playing")
+    cur_uri = cur.get("uri") if isinstance(cur, dict) else None
+    raw_queue = data.get("queue") or []
+    queue_items = []
+    for item in raw_queue:
+        if not isinstance(item, dict) or not item.get("uri"):
+            continue
+        artists = ", ".join(a.get("name", "") for a in (item.get("artists") or []) if a.get("name"))
+        queue_items.append(
+            {
+                "id": item.get("id"),
+                "uri": item.get("uri"),
+                "track": item.get("name") or "",
+                "artists": artists,
+                "duration_ms": int(item.get("duration_ms") or 0),
+            }
+        )
+    return {
+        "currently_playing_uri": cur_uri,
+        "queue": queue_items,
+    }
+
+
+def _vibe_dj_tick_locked(
+    state: dict[str, Any],
+    *,
+    working_agents: int = 0,
+    force: bool = False,
+) -> dict[str, Any]:
+    now = time.time()
+    taste = str(state.get("taste") or "")
+    custom_queries = dict(state.get("custom_queries") or {})
+    auto_tier, effective_tier, effective_vibe = _resolve_vibe_selection(
+        working_agents,
+        state.get("tier_override"),
+        state.get("vibe"),
+        inverse=bool(state.get("inverse", False)),
+        taste=taste,
+        custom_queries=custom_queries,
+    )
+    if not state.get("enabled"):
+        state["next_queue_in_s"] = None
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+    if not force and (now - float(state.get("last_tick_at") or 0.0)) < VIBE_DJ_MIN_TICK_INTERVAL_S:
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+    status = get_status(force=force)
+    if not status.get("authenticated"):
+        state["last_action"] = "not_authenticated"
+        state["last_error"] = status.get("error") or ""
+        state["next_queue_in_s"] = None
+        state["last_tick_at"] = now
+        _save_vibe_dj_state(state)
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+    if not status.get("active"):
+        state["last_action"] = "idle"
+        state["last_error"] = ""
+        state["next_queue_in_s"] = None
+        state["last_tick_at"] = now
+        _save_vibe_dj_state(state)
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+    if not status.get("is_playing"):
+        state["last_action"] = "paused"
+        state["last_error"] = ""
+        state["next_queue_in_s"] = None
+        state["last_tick_at"] = now
+        _save_vibe_dj_state(state)
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+    added: list[dict[str, Any]] = []
+    try:
+        track_id = status.get("track_id")
+        current_uri = _track_uri(track_id) if isinstance(track_id, str) and track_id else None
+        duration_ms = max(0, int(status.get("duration_ms") or 0))
+        progress_ms = max(0, int(status.get("progress_ms") or 0))
+        remaining_ms = max(0, duration_ms - progress_ms) if duration_ms > 0 else 0
+
+        recent_uris: list[str] = list(state.get("recent_uris") or [])
+        if current_uri and current_uri not in recent_uris:
+            recent_uris.append(current_uri)
+
+        # If the playing track advanced, drop it from queued_tracks and clear the per-track guard
+        still_queued = [
+            item
+            for item in (state.get("queued_tracks") or [])
+            if item.get("uri") and item.get("uri") != current_uri
+        ]
+        if current_uri and current_uri != state.get("last_playing_uri"):
+            state["queued_for_playing_uri"] = None
+
+        already_queued_for_track = bool(
+            current_uri and state.get("queued_for_playing_uri") == current_uri and still_queued
+        )
+
+        if already_queued_for_track and not force:
+            state["recent_uris"] = recent_uris[-VIBE_DJ_RECENT_LIMIT:]
+            state["queued_tracks"] = still_queued
+            state["last_playing_uri"] = current_uri
+            state["last_tier"] = effective_tier
+            state["last_vibe"] = effective_vibe
+            state["next_queue_in_s"] = None
+            state["last_action"] = "steady"
+            state["last_error"] = ""
+            state["last_tick_at"] = now
+            _save_vibe_dj_state(state)
+            return _format_vibe_dj_response(state, working_agents=working_agents)
+
+        # Just-in-time: wait until <= 60s left in the current track unless forced
+        if not force and duration_ms > 0 and remaining_ms > VIBE_DJ_LEAD_TIME_MS:
+            wait_s = max(1, (remaining_ms - VIBE_DJ_LEAD_TIME_MS + 999) // 1000)
+            state["recent_uris"] = recent_uris[-VIBE_DJ_RECENT_LIMIT:]
+            state["queued_tracks"] = still_queued
+            state["last_playing_uri"] = current_uri
+            state["last_tier"] = effective_tier
+            state["last_vibe"] = effective_vibe
+            state["next_queue_in_s"] = wait_s
+            state["last_action"] = "waiting"
+            state["last_error"] = ""
+            state["last_tick_at"] = now
+            _save_vibe_dj_state(state)
+            return _format_vibe_dj_response(state, working_agents=working_agents)
+
+        # Within 60s of track end (or forced): queue 1 fresh track matching live tier/vibe
+        q_info = get_queue()
+        q_cur_uri = q_info.get("currently_playing_uri") or current_uri
+        if q_cur_uri and q_cur_uri not in recent_uris:
+            recent_uris.append(q_cur_uri)
+        upcoming_uris = {item["uri"] for item in (q_info.get("queue") or [])[:5] if item.get("uri")}
+
+        hard_excluded = upcoming_uris | {item["uri"] for item in still_queued} | ({q_cur_uri} if q_cur_uri else set())
+        soft_excluded = hard_excluded | set(recent_uris)
+
+        offset = int(state.get("offset") or 0)
+        candidates: list[dict[str, Any]] = []
+        fallback_candidates: list[dict[str, Any]] = []
+        seen_uris: set[str] = set()
+        for attempt in range(3):
+            res = suggest_tracks(
+                intensity=effective_tier,
+                vibe=effective_vibe,
+                offset=offset + attempt,
+                limit=10,
+                taste=taste,
+                custom_queries=custom_queries,
+            )
+            for tr in res.get("tracks") or []:
+                uri = tr.get("uri")
+                if not uri or uri in seen_uris or uri in hard_excluded:
+                    continue
+                seen_uris.add(uri)
+                if uri not in soft_excluded:
+                    candidates.append(tr)
+                else:
+                    fallback_candidates.append(tr)
+            if candidates:
+                break
+
+        picks = (candidates + fallback_candidates)[:1]
+        for tr in picks:
+            queue_uri(tr["uri"])
+            entry = {
+                "uri": tr["uri"],
+                "track": tr.get("track") or "",
+                "artists": tr.get("artists") or "",
+                "duration_ms": int(tr.get("duration_ms") or 0),
+                "tier": effective_tier,
+                "vibe": effective_vibe,
+                "queued_at": now,
+            }
+            still_queued = [entry]
+            added.append(entry)
+            if tr["uri"] not in recent_uris:
+                recent_uris.append(tr["uri"])
+
+        state["recent_uris"] = recent_uris[-VIBE_DJ_RECENT_LIMIT:]
+        state["queued_tracks"] = still_queued
+        state["queued_for_playing_uri"] = q_cur_uri if added else state.get("queued_for_playing_uri")
+        state["last_playing_uri"] = q_cur_uri
+        state["offset"] = (offset + 1) % 30 if added else offset
+        state["last_tier"] = effective_tier
+        state["last_vibe"] = effective_vibe
+        state["next_queue_in_s"] = None
+        state["last_tick_at"] = now
+        state["last_error"] = ""
+        if added:
+            state["last_queued_at"] = now
+            state["last_action"] = "queued:1"
+        else:
+            state["last_action"] = "steady"
+    except Exception as exc:
+        state["last_action"] = "error"
+        state["last_error"] = str(exc)
+        state["last_tick_at"] = now
+
+    _save_vibe_dj_state(state)
+    return _format_vibe_dj_response(state, working_agents=working_agents, added=added)
+
+
+def get_vibe_dj_status(working_agents: int = 0) -> dict[str, Any]:
+    with _vibe_dj_lock():
+        state = _load_vibe_dj_state()
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+
+def set_vibe_dj(
+    *,
+    enabled: bool | None = None,
+    inverse: bool | None = None,
+    tier_override: str | None = _UNSET,
+    vibe: str | None = _UNSET,
+    taste: str | None = _UNSET,
+    tier_queries: dict[str, str | None] | None = None,
+    target_queue_depth: int | None = None,
+    working_agents: int = 0,
+    sync_now: bool = True,
+) -> dict[str, Any]:
+    if tier_override is not _UNSET and tier_override is not None:
+        if tier_override not in VIBE_PRESETS:
+            raise ValueError(f"Invalid tier: {tier_override}")
+    if tier_queries is not None:
+        for k in tier_queries:
+            if k not in VIBE_PRESETS:
+                raise ValueError(f"Invalid tier in tier_queries: {k}")
+    if target_queue_depth is not None:
+        if not (1 <= int(target_queue_depth) <= VIBE_DJ_MAX_DEPTH):
+            raise ValueError(f"target_queue_depth must be between 1 and {VIBE_DJ_MAX_DEPTH}")
+
+    with _vibe_dj_lock():
+        state = _load_vibe_dj_state()
+        if enabled is not None:
+            state["enabled"] = bool(enabled)
+            if not state["enabled"]:
+                state["last_action"] = "off"
+                state["last_error"] = ""
+        if inverse is not None:
+            state["inverse"] = bool(inverse)
+        if tier_override is not _UNSET:
+            state["tier_override"] = tier_override
+        custom_updated = False
+        if taste is not _UNSET:
+            state["taste"] = str(taste or "").strip()[:200]
+            custom_updated = True
+        if tier_queries is not None:
+            cq = dict(state.get("custom_queries") or {})
+            for k, val in tier_queries.items():
+                cleaned = str(val or "").strip()[:200]
+                if cleaned:
+                    cq[k] = cleaned
+                else:
+                    cq.pop(k, None)
+            state["custom_queries"] = cq
+            custom_updated = True
+        if vibe is not _UNSET:
+            state["vibe"] = vibe
+        elif custom_updated:
+            _, eff_tier, _ = _resolve_vibe_selection(
+                working_agents,
+                state.get("tier_override"),
+                None,
+                inverse=bool(state.get("inverse", False)),
+                taste=state.get("taste") or "",
+                custom_queries=state.get("custom_queries") or {},
+            )
+            if _custom_queries_for_tier(eff_tier, taste=state.get("taste") or "", custom_queries=state.get("custom_queries") or {}):
+                state["vibe"] = "custom"
+            elif state.get("vibe") == "custom":
+                state["vibe"] = None
+        if target_queue_depth is not None:
+            state["target_queue_depth"] = int(target_queue_depth)
+
+        _save_vibe_dj_state(state)
+        if state["enabled"] and sync_now:
+            return _vibe_dj_tick_locked(state, working_agents=working_agents, force=False)
+        return _format_vibe_dj_response(state, working_agents=working_agents)
+
+
+def tick_vibe_dj(working_agents: int = 0, force: bool = False) -> dict[str, Any]:
+    with _vibe_dj_lock():
+        state = _load_vibe_dj_state()
+        if not state.get("enabled"):
+            return _format_vibe_dj_response(state, working_agents=working_agents)
+        return _vibe_dj_tick_locked(state, working_agents=working_agents, force=force)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="herdr-spotify")
+    parser.add_argument("--_auth-worker", action="store_true", help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_status = sub.add_parser("status")
+    p_status.add_argument("--refresh", action="store_true")
+
+    p_set = sub.add_parser("set-client-id")
+    p_set.add_argument("client_id")
+    p_set.add_argument("--redirect-uri", default=None)
+
+    sub.add_parser("auth-start")
+    sub.add_parser("auth-status")
+
+    p_complete = sub.add_parser("auth-complete")
+    p_complete.add_argument("url_or_code")
+
+    sub.add_parser("logout")
+
+    for name in ("play", "pause", "toggle", "next", "prev"):
+        sub.add_parser(name)
+
+    p_seek = sub.add_parser("seek")
+    p_seek.add_argument("position_ms", type=int)
+
+    p_vol = sub.add_parser("volume")
+    p_vol.add_argument("percent", type=int)
+
+    p_shuf = sub.add_parser("shuffle")
+    p_shuf.add_argument("state", choices=["on", "off"])
+
+    p_rep = sub.add_parser("repeat")
+    p_rep.add_argument("state", choices=["off", "context", "track"])
+
+    p_like = sub.add_parser("like")
+    p_like.add_argument("track_id")
+    p_like.add_argument("state", choices=["on", "off"])
+
+    sub.add_parser("devices")
+
+    p_transfer = sub.add_parser("transfer")
+    p_transfer.add_argument("device_id")
+
+    p_suggest = sub.add_parser("suggest")
+    p_suggest.add_argument("--intensity", default="flow", choices=["zen", "flow", "cranking", "overdrive"])
+    p_suggest.add_argument("--vibe", default=None)
+    p_suggest.add_argument("--offset", type=int, default=0)
+    p_suggest.add_argument("--limit", type=int, default=5)
+
+    p_play_uri = sub.add_parser("play-uri")
+    p_play_uri.add_argument("uri")
+
+    p_queue_uri = sub.add_parser("queue-uri")
+    p_queue_uri.add_argument("uri")
+
+    p_dj_status = sub.add_parser("vibe-dj-status")
+    p_dj_status.add_argument("--working-agents", type=int, default=0)
+
+    p_dj_set = sub.add_parser("vibe-dj-set")
+    p_dj_set.add_argument("--enabled", choices=["on", "off"], default=None)
+    p_dj_set.add_argument("--inverse", choices=["on", "off"], default=None)
+    p_dj_set.add_argument("--tier", choices=["auto", "zen", "flow", "cranking", "overdrive"], default=None)
+    p_dj_set.add_argument("--vibe", default=None)
+    p_dj_set.add_argument("--taste", default=None)
+    p_dj_set.add_argument("--tier-query", action="append", default=None, help="TIER=QUERY (empty QUERY clears)")
+    p_dj_set.add_argument("--depth", type=int, default=None)
+    p_dj_set.add_argument("--working-agents", type=int, default=0)
+    p_dj_set.add_argument("--no-sync", action="store_true")
+
+    p_dj_tick = sub.add_parser("vibe-dj-tick")
+    p_dj_tick.add_argument("--working-agents", type=int, default=0)
+    p_dj_tick.add_argument("--force", action="store_true")
+
+    args = parser.parse_args()
+
+    if args._auth_worker:
+        return run_auth_worker()
+
+    try:
+        cmd = args.cmd or "status"
+        if cmd == "status":
+            out = get_status(force=getattr(args, "refresh", False))
+        elif cmd == "set-client-id":
+            out = set_client_id(args.client_id, redirect_uri=args.redirect_uri)
+        elif cmd == "auth-start":
+            out = start_auth()
+        elif cmd == "auth-status":
+            out = get_auth_status()
+        elif cmd == "auth-complete":
+            out = complete_auth_from_input(args.url_or_code)
+        elif cmd == "logout":
+            out = logout()
+        elif cmd in ("play", "pause", "toggle", "next", "prev"):
+            out = control_playback(cmd)
+        elif cmd == "seek":
+            out = control_playback("seek", value=str(args.position_ms))
+        elif cmd == "volume":
+            out = control_playback("volume", value=str(args.percent))
+        elif cmd == "shuffle":
+            out = control_playback("shuffle", value=args.state)
+        elif cmd == "repeat":
+            out = control_playback("repeat", value=args.state)
+        elif cmd == "like":
+            out = control_playback("like", value=args.state, track_id=args.track_id)
+        elif cmd == "devices":
+            out = list_devices()
+        elif cmd == "transfer":
+            out = control_playback("transfer", value=args.device_id)
+        elif cmd == "suggest":
+            out = suggest_tracks(
+                intensity=args.intensity,
+                vibe=args.vibe,
+                offset=args.offset,
+                limit=args.limit,
+            )
+        elif cmd == "play-uri":
+            out = play_uri(args.uri)
+        elif cmd == "queue-uri":
+            out = queue_uri(args.uri)
+        elif cmd == "vibe-dj-status":
+            out = get_vibe_dj_status(working_agents=args.working_agents)
+        elif cmd == "vibe-dj-set":
+            kwargs = {
+                "working_agents": args.working_agents,
+                "sync_now": not args.no_sync,
+            }
+            if args.enabled is not None:
+                kwargs["enabled"] = args.enabled == "on"
+            if args.inverse is not None:
+                kwargs["inverse"] = args.inverse == "on"
+            if args.tier is not None:
+                kwargs["tier_override"] = None if args.tier == "auto" else args.tier
+            if args.vibe is not None:
+                kwargs["vibe"] = None if args.vibe == "auto" else args.vibe
+            if args.taste is not None:
+                kwargs["taste"] = args.taste
+            if args.tier_query:
+                tq = {}
+                for item in args.tier_query:
+                    if "=" not in item:
+                        raise ValueError(f"Expected TIER=QUERY, got: {item}")
+                    tier_k, query_v = item.split("=", 1)
+                    tq[tier_k.strip()] = query_v.strip()
+                kwargs["tier_queries"] = tq
+            if args.depth is not None:
+                kwargs["target_queue_depth"] = args.depth
+            out = set_vibe_dj(**kwargs)
+        elif cmd == "vibe-dj-tick":
+            out = tick_vibe_dj(working_agents=args.working_agents, force=args.force)
+        else:
+            raise ValueError(f"Unknown command: {cmd}")
+        print(json.dumps(out))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

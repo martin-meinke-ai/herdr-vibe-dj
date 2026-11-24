@@ -1,0 +1,9 @@
+{
+  "place": "none",
+  "title": "Spotify Mini-Player",
+  "overlay": {
+    "kind": "dialog",
+    "width": 470,
+    "height": 420
+  }
+}

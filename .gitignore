@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+mods/vibe-dj/art/
+.DS_Store
+gpui-kit.d.ts
+jsconfig.json
