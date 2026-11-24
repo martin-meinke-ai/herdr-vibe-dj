@@ -182,9 +182,11 @@ export default class VibeDjStatus extends View {
     const spTrackLabel = spActive ? truncate(sp.artists ? `${sp.track} — ${sp.artists}` : sp.track, 34) : "♪ Spotify";
     const djOn = Boolean(this.vibeDj?.enabled);
     const djInv = Boolean(this.vibeDj?.inverse);
+    const djPinned = Boolean(this.vibeDj?.tier_override);
     const djTierId = this.vibeDj?.tier_override || computeAutoTier(djInv).tier;
     const djTier = TIER_BADGES[djTierId] || TIER_BADGES.flow;
-    const djBadgeText = `${djInv ? "DJ↓" : "DJ"}·${djTier.label}${this.vibeDj?.tier_override ? "*" : ""}`;
+    const djBadgeColor = djPinned ? "#f59e0b" : djTier.color;
+    const djBadgeText = djPinned ? `PIN·${djTier.label}` : `${djInv ? "DJ↓" : "DJ"}·${djTier.label}`;
 
     return h_flex()
       .gap(4)
@@ -217,7 +219,7 @@ export default class VibeDjStatus extends View {
                 .bg(t.selected)
                 .text_size(10)
                 .font_semibold()
-                .text_color(djTier.color)
+                .text_color(djBadgeColor)
                 .child(djBadgeText),
             ),
           ),

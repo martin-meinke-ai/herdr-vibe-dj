@@ -3,6 +3,7 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, agents, exec, hc, theme, props, closeOverlay, setShared, window, checking } from "herdr";
 
 const SPOTIFY_GREEN = "#1DB954";
+const PIN_AMBER = "#f59e0b";
 const SPOTIFY_GREEN_HOVER = "#1ed760";
 const SPOTIFY_DASHBOARD_URL = "https://developer.spotify.com/dashboard";
 
@@ -1089,18 +1090,27 @@ export default class VibeDj extends View {
               .child(div().flex_1())
               .when(this.vibeTierOverride !== null, (el) =>
                 el.child(
-                  this.pillBtn(
-                    "vibe-auto-reset",
-                    "Auto",
-                    (_e, cx) => {
+                  div()
+                    .id("vibe-auto-reset")
+                    .px(7)
+                    .py(2)
+                    .rounded(6)
+                    .cursor_pointer()
+                    .bg(t.selected)
+                    .border_1()
+                    .border_color(PIN_AMBER)
+                    .text_size(10.5)
+                    .font_semibold()
+                    .text_color(PIN_AMBER)
+                    .hover((s) => s.bg(t.hover))
+                    .on_click((_e, cx) => {
                       this.vibeTierOverride = null;
                       this.vibeOffset = 0;
                       const nextTier = computeAutoTier(this.vibeInverse).tier;
                       this.loadSuggestions(cx, { tier: nextTier, offset: 0 });
-                      this.updateVibeDj(cx, { tier: null, noSync: !djOn });
-                    },
-                    { px: 6, py: 2, size: 10.5 },
-                  ),
+                      this.updateVibeDj(cx, { tier: null, noSync: !djOn, notice: "Tier unpinned · following agents (Auto)" });
+                    })
+                    .child("× Unpin"),
                 ),
               )
               .child(
@@ -1124,32 +1134,49 @@ export default class VibeDj extends View {
             h_flex()
               .gap(6)
               .children(
-                TIERS.map((tier) =>
-                  div()
+                TIERS.map((tier) => {
+                  const isPinned = this.vibeTierOverride === tier.id;
+                  const isAutoTier = auto.tier === tier.id;
+                  const isActive = activeTierId === tier.id;
+                  const accentColor = isPinned ? PIN_AMBER : isActive ? SPOTIFY_GREEN : t.muted;
+                  const borderColor = isPinned ? PIN_AMBER : isActive ? SPOTIFY_GREEN : t.border;
+                  const labelText = isPinned
+                    ? `${tier.label} (pin)`
+                    : (this.vibeTierOverride !== null && isAutoTier ? `• ${tier.label}` : tier.label);
+                  return div()
                     .id(`vibe-tier-${tier.id}`)
                     .flex_1()
                     .py(4)
                     .rounded(6)
                     .cursor_pointer()
                     .border_1()
-                    .border_color(activeTierId === tier.id ? SPOTIFY_GREEN : t.border)
-                    .bg(activeTierId === tier.id ? t.selected : t.chrome)
+                    .border_color(borderColor)
+                    .bg(isActive ? t.selected : t.chrome)
                     .text_size(11)
-                    .text_color(activeTierId === tier.id ? SPOTIFY_GREEN : t.muted)
+                    .text_color(accentColor)
                     .flex()
                     .justify_center()
                     .hover((s) => s.bg(t.hover).text_color(t.foreground))
                     .on_click((_e, cx) => {
+                      if (this.vibeTierOverride === tier.id) {
+                        this.vibeTierOverride = null;
+                        this.vibeOffset = 0;
+                        const nextTier = computeAutoTier(this.vibeInverse).tier;
+                        if (this.showVibePrefs) this.syncPrefsInputsForTier(nextTier);
+                        this.loadSuggestions(cx, { tier: nextTier, offset: 0 });
+                        this.updateVibeDj(cx, { tier: null, noSync: !djOn, notice: "Tier unpinned · following agents (Auto)" });
+                        return;
+                      }
                       this.vibeTierOverride = tier.id;
                       const nextVibe = this.hasCustomForTier(tier.id) ? "custom" : tier.vibes[0];
                       this.vibeGenre = nextVibe;
                       this.vibeOffset = 0;
                       if (this.showVibePrefs) this.syncPrefsInputsForTier(tier.id);
                       this.loadSuggestions(cx, { tier: tier.id, vibe: nextVibe, offset: 0 });
-                      this.updateVibeDj(cx, { tier: tier.id, vibe: nextVibe, noSync: !djOn });
+                      this.updateVibeDj(cx, { tier: tier.id, vibe: nextVibe, noSync: !djOn, notice: `Pinned to ${tier.label} (click again or × Unpin for Auto)` });
                     })
-                    .child(tier.label),
-                ),
+                    .child(labelText);
+                }),
               ),
           )
           // Genre pills + Prefs + Reroll
