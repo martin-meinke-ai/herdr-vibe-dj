@@ -3,6 +3,12 @@ import { h_flex } from "gpui-base";
 import { spaces, agents, theme, window, exec, hc, openOverlay, shared, setShared, checking } from "herdr";
 
 const SPOTIFY_GREEN = "#1DB954";
+const TIER_BADGES = {
+  zen: { label: "Zen", color: "#38bdf8" },
+  flow: { label: "Flow", color: "#1DB954" },
+  cranking: { label: "Crank", color: "#f59e0b" },
+  overdrive: { label: "Max", color: "#f43f5e" },
+};
 
 function truncate(str, max) {
   const s = String(str || "");
@@ -175,6 +181,10 @@ export default class VibeDjStatus extends View {
     const spPlaying = Boolean(sp?.is_playing);
     const spTrackLabel = spActive ? truncate(sp.artists ? `${sp.track} — ${sp.artists}` : sp.track, 34) : "♪ Spotify";
     const djOn = Boolean(this.vibeDj?.enabled);
+    const djInv = Boolean(this.vibeDj?.inverse);
+    const djTierId = this.vibeDj?.tier_override || computeAutoTier(djInv).tier;
+    const djTier = TIER_BADGES[djTierId] || TIER_BADGES.flow;
+    const djBadgeText = `${djInv ? "DJ↓" : "DJ"}·${djTier.label}${this.vibeDj?.tier_override ? "*" : ""}`;
 
     return h_flex()
       .gap(4)
@@ -207,8 +217,8 @@ export default class VibeDjStatus extends View {
                 .bg(t.selected)
                 .text_size(10)
                 .font_semibold()
-                .text_color(SPOTIFY_GREEN)
-                .child(this.vibeDj?.inverse ? "DJ↓" : "DJ"),
+                .text_color(djTier.color)
+                .child(djBadgeText),
             ),
           ),
       )
